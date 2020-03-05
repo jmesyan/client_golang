@@ -58,13 +58,40 @@ const bucketLabel = "le"
 // tailored to broadly measure the response time (in seconds) of a network
 // service. Most likely, however, you will be required to define buckets
 // customized to your use case.
-var (
-	DefBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
+var DefBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
 
+// DefSparseBucketsZeroThreshold is the default value for
+// SparseBucketsZeroThreshold in the HistogramOpts.
+var DefSparseBucketsZeroThreshold = 1e-128
+
+var (
 	errBucketLabelNotAllowed = fmt.Errorf(
 		"%q is not allowed as label name in histograms", bucketLabel,
 	)
+	sparseBounds sync.Map // Global repository of sparseBounds, map[uint8][]float64.
 )
+
+func makeSparseBounds(resolution uint8) []float64 {
+	switch resolution {
+	case 0:
+		return nil
+	case 1:
+		return []float64{}
+	}
+	existingBounds, ok := sparseBounds.Load(resolution)
+	if ok {
+		return existingBounds.([]float64)
+	}
+	bounds := make([]float64, int(resolution)-1)
+	factor := math.Pow(10, 1/float64(resolution))
+	current := 1.
+	for i := range bounds {
+		current *= factor
+		bounds[i] = current
+	}
+	sparseBounds.Store(resolution, bounds)
+	return bounds
+}
 
 // LinearBuckets creates 'count' buckets, each 'width' wide, where the lowest
 // bucket has an upper bound of 'start'. The final +Inf bucket is not counted
@@ -146,8 +173,32 @@ type HistogramOpts struct {
 	// element in the slice is the upper inclusive bound of a bucket. The
 	// values must be sorted in strictly increasing order. There is no need
 	// to add a highest bucket with +Inf bound, it will be added
-	// implicitly. The default value is DefBuckets.
+	// implicitly. If Buckets is left as nil or set to a slice of length
+	// zero, it is replaced by default buckets. The default buckets are
+	// DefBuckets if no sparse buckets (see below) are used, otherwise the
+	// default is no buckets. (In other words, if you want to use both
+	// reguler buckets and sparse buckets, you have to define the regular
+	// buckets here explicitly.)
 	Buckets []float64
+
+	// If SparseBucketsResolution is not zero, sparse buckets are used (in
+	// addition to the regular buckets, if defined above). Every power of
+	// ten is divided into the given number of exponential buckets. For
+	// example, if set to 3, the bucket boundaries are approximately […,
+	// 0.1, 0.215, 0.464, 1, 2.15, 4,64, 10, 21.5, 46.4, 100, …] Histograms
+	// can only be properly aggregated if they use the same
+	// resolution. Therefore, it is recommended to use 20 as a resolution,
+	// which is generally expected to be a good tradeoff between resource
+	// usage and accuracy (resulting in a maximum error of quantile values
+	// of about 6%).
+	SparseBucketsResolution uint8
+	// All observations with an absolute value of less or equal
+	// SparseBucketsZeroThreshold are accumulated into a “zero” bucket. For
+	// best results, this should be close to a bucket boundary. This is
+	// moste easily accomplished by picking a power of ten. If
+	// SparseBucketsZeroThreshold is left at zero (or set to a negative
+	// value), DefSparseBucketsZeroThreshold is used as the threshold.
+	SparseBucketsZeroThreshold float64
 }
 
 // NewHistogram creates a new Histogram based on the provided HistogramOpts. It
@@ -184,16 +235,20 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 		}
 	}
 
-	if len(opts.Buckets) == 0 {
-		opts.Buckets = DefBuckets
-	}
-
 	h := &histogram{
-		desc:        desc,
-		upperBounds: opts.Buckets,
-		labelPairs:  makeLabelPairs(desc, labelValues),
-		counts:      [2]*histogramCounts{{}, {}},
-		now:         time.Now,
+		desc:            desc,
+		upperBounds:     opts.Buckets,
+		sparseBounds:    makeSparseBounds(opts.SparseBucketsResolution),
+		sparseThreshold: opts.SparseBucketsZeroThreshold,
+		labelPairs:      makeLabelPairs(desc, labelValues),
+		counts:          [2]*histogramCounts{{}, {}},
+		now:             time.Now,
+	}
+	if len(h.upperBounds) == 0 && opts.SparseBucketsResolution == 0 {
+		h.upperBounds = DefBuckets
+	}
+	if h.sparseThreshold <= 0 {
+		h.sparseThreshold = DefSparseBucketsZeroThreshold
 	}
 	for i, upperBound := range h.upperBounds {
 		if i < len(h.upperBounds)-1 {
@@ -228,6 +283,19 @@ type histogramCounts struct {
 	sumBits uint64
 	count   uint64
 	buckets []uint64
+	// sparse buckets are implemented with a sync.Map for this PoC. A
+	// dedicated data structure will likely be more efficient.
+	// There are separate maps for negative and positive observations.
+	// The map's value is a uint64 count.
+	// The map's key is the logarithmic index of the bucket. Index 0 is for an
+	// upper bound of 1. Each increment/decrement by SparseBucketsResolution
+	// multiplies/divides the upper bound by 10. Indices in between are
+	// spaced exponentially as defined in spareBounds.
+	sparseBucketsPositive, spareBucketsNegative sync.Map
+	// sparseZeroBucket counts all (positive and negative) observations in
+	// the zero bucket (with an absolute value less or equal
+	// SparseBucketsZeroThreshold).
+	sparseZeroBucket uint64
 }
 
 type histogram struct {
@@ -259,9 +327,11 @@ type histogram struct {
 	// http://golang.org/pkg/sync/atomic/#pkg-note-BUG.
 	counts [2]*histogramCounts
 
-	upperBounds []float64
-	labelPairs  []*dto.LabelPair
-	exemplars   []atomic.Value // One more than buckets (to include +Inf), each a *dto.Exemplar.
+	upperBounds     []float64
+	labelPairs      []*dto.LabelPair
+	exemplars       []atomic.Value // One more than buckets (to include +Inf), each a *dto.Exemplar.
+	sparseBounds    []float64      // Each 1≤x≤10. One fewer than SparseBucketsResolution. If nil, don't use sparse buckets.
+	sparseThreshold float64
 
 	now func() time.Time // To mock out time.Now() for testing.
 }
